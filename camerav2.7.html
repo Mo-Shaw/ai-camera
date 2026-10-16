@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>AI摄影教练 V2.7 · 专业参数版</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#111; overflow:hidden; font-family:sans-serif; }
+  #stage { position:fixed; inset:0; }
+  #stage video { position:absolute; inset:0; width:100%; height:100%; opacity:0; }
+  #stage canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #panel { position:fixed; top:12px; left:12px; background:rgba(0,0,0,0.6);
+           color:#fff; padding:12px 14px; border-radius:12px; font-size:13px;
+           width:250px; line-height:1.7; }
+  #panel b { color:#ffd700; }
+  #scenes { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .sc { padding:5px 10px; background:rgba(255,255,255,0.15); border-radius:14px;
+        font-size:13px; cursor:pointer; }
+  .sc.on { background:rgba(255,80,80,0.8); }
+  #coach { position:fixed; top:12px; right:12px; background:rgba(255,80,80,0.92);
+           color:#fff; padding:12px 16px; border-radius:12px; font-size:17px;
+           font-weight:bold; max-width:210px; line-height:1.5; }
+  #pose { position:fixed; bottom:90px; left:0; right:0; text-align:center;
+          color:#ffd700; font-size:14px; text-shadow:0 1px 3px #000; }
+  #bar { position:fixed; bottom:24px; left:0; right:0; display:flex; justify-content:center; gap:16px; }
+  button { padding:12px 22px; font-size:16px; border:none; border-radius:24px;
+           background:rgba(255,80,80,0.9); color:#fff; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="c"></canvas>
+</div>
+
+<div id="panel">
+  <div>环境亮度：<b id="lux">检测中…</b></div>
+  <div id="suggest">参数建议加载中…</div>
+  <div id="scenes"></div>
+</div>
+<div id="coach">正在加载人脸模型…</div>
+<div id="pose"></div>
+
+<div id="bar">
+  <button onclick="shoot()">📷 截图</button>
+  <button onclick="flip()">🔄 翻转镜头</button>
+  <button onclick="toggleMirror()">🪞 镜像</button>
+</div>
+
+<script>
+const v = document.getElementById('v'), c = document.getElementById('c'), ctx = c.getContext('2d');
+const luxEl = document.getElementById('lux'), sugEl = document.getElementById('suggest');
+const coachEl = document.getElementById('coach'), poseEl = document.getElementById('pose');
+let stream = null, facing = 'environment', scene = '人像';
+let mirrored = false;
+let model = null;
+
+blazeface.load().then(m => {
+  model = m;
+  coachEl.textContent = '人脸模型就绪';
+}).catch(e => {
+  coachEl.textContent = '模型加载失败（需联网首次下载）';
+});
+
+// ★ 专业参数矩阵：8项，对应手机专业模式全部可调项
+const RULES = {
+  '人像':  { iso: 200,  shutter: '1/125s', ev: '+0.3（逆光+0.7）', wb: '5500K',
+            focus: 'AF-S点人脸', zoom: '1x~2x', meter: '中央重点', fmt: 'JPG',
+            note: '开人像模式虚化；侧45°显瘦' },
+  '风景':  { iso: 100,  shutter: '1/250s', ev: '-0.3（保天空）', wb: '日光5600K',
+            focus: 'AF-S对远处', zoom: '0.6x广角', meter: '矩阵测光', fmt: 'RAW+JPG',
+            note: 'f/8~f/11最清晰；带前景层次' },
+  '夜景':  { iso: 1600, shutter: '1/60s',  ev: '0', wb: '自动或3800K',
+            focus: 'AF-S对亮处', zoom: '1x', meter: '中央重点', fmt: 'RAW+JPG',
+            note: '手持1/60是极限，靠稳或上架子' },
+  '室内':  { iso: 800,  shutter: '1/60s',  ev: '+0.3', wb: '按光源：白炽灯3000K/日光4600K',
+            focus: 'AF-S', zoom: '1x', meter: '中央重点', fmt: 'JPG',
+            note: '脸朝窗借光，避开顶光' },
+  '运动':  { iso: 800,  shutter: '1/500s', ev: '0', wb: '自动',
+            focus: 'AF-C连续追焦', zoom: '1x~2x', meter: '中央重点', fmt: 'JPG',
+            note: '快门优先；提前半按预对焦' },
+  '静物':  { iso: 100,  shutter: '1/10s起', ev: '-0.3（保高光）', wb: '4600K',
+            focus: 'MF手动对焦+放大确认', zoom: '1x~2x', meter: '点测光', fmt: 'RAW',
+            note: '架稳再拍；1/10s必须固定' }
+};
+Object.keys(RULES).forEach(name => {
+  const d = document.createElement('div');
+  d.className = 'sc' + (name === scene ? ' on' : '');
+  d.textContent = name;
+  d.onclick = () => { scene = name;
+    document.querySelectorAll('.sc').forEach(x => x.classList.remove('on'));
+    d.classList.add('on'); updateLux(); rotatePose(); };
+  document.getElementById('scenes').appendChild(d);
+});
+
+function applyMirror() {}
+function toggleMirror() { mirrored = !mirrored; }
+
+async function start() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: facing } } });
+    v.srcObject = stream;
+    mirrored = (facing === 'user');
+  } catch(e) { luxEl.textContent = '摄像头打不开'; }
+}
+
+function flip() { facing = facing === 'environment' ? 'user' : 'environment'; start(); }
+
+const probe = document.createElement('canvas');
+probe.width = 32; probe.height = 32;
+const pctx = probe.getContext('2d', { willReadFrequently: true });
+function getBrightness() {
+  if (!v.videoWidth) return null;
+  pctx.drawImage(v, 0, 0, 32, 32);
+  const d = pctx.getImageData(0, 0, 32, 32).data;
+  let sum = 0;
+  for (let i = 0; i < d.length; i += 4) sum += (d[i] + d[i+1] + d[i+2]) / 3;
+  return Math.round(sum / (d.length / 4));
+}
+
+// ★ 8项参数输出
+function updateLux() {
+  const b = getBrightness(), r = RULES[scene];
+  if (b === null) { luxEl.textContent = '检测中…'; return; }
+  let iso = r.iso, tag;
+  if (b < 50)       { iso = Math.min(6400, r.iso * 4); tag = '很暗'; }
+  else if (b < 100) { iso = Math.min(6400, r.iso * 2); tag = '偏暗'; }
+  else if (b < 170) { tag = '适中'; }
+  else              { iso = Math.max(50, Math.round(r.iso / 2)); tag = '明亮'; }
+  luxEl.textContent = b + '（' + tag + '）';
+  sugEl.innerHTML =
+    '⚙️ <b>ISO</b> ' + iso + '<br>' +
+    '⚙️ <b>快门</b> ' + r.shutter + '<br>' +
+    '⚙️ <b>EV</b> ' + r.ev + '<br>' +
+    '⚙️ <b>白平衡</b> ' + r.wb + '<br>' +
+    '⚙️ <b>对焦</b> ' + r.focus + '<br>' +
+    '⚙️ <b>变焦</b> ' + r.zoom + '　<b>测光</b> ' + r.meter + '<br>' +
+    '⚙️ <b>格式</b> ' + r.fmt + '<br>' +
+    '💡 ' + r.note;
+}
+setInterval(updateLux, 800);
+
+// ★ 九宫格精确定位喊话
+async function coach() {
+  if (!model) return;
+  if (!v.videoWidth) return;
+  try {
+    const preds = await model.estimateFaces(v, false);
+    if (!preds.length) { coachEl.textContent = '没看到人，对准主体'; return; }
+    const tl = preds[0].topLeft, br = preds[0].bottomRight;
+    const fw = br[0] - tl[0], fh = br[1] - tl[1];
+    const s = Math.max(innerWidth / v.videoWidth, innerHeight / v.videoHeight);
+    const dx = (innerWidth - v.videoWidth * s) / 2, dy = (innerHeight - v.videoHeight * s) / 2;
+    const cx = (tl[0] + fw / 2) * s + dx, cy = (tl[1] + fh / 2) * s + dy;
+    let rx = cx / innerWidth, ry = cy / innerHeight;
+    if (mirrored) rx = 1 - rx;
+    const area = (fw * fh * s * s) / (innerWidth * innerHeight);
+
+    const D = (a, b) => Math.abs(a - b);
+    let msg = '✅ 到位！按下快门';
+    if (area < 0.05)      msg = '🔍 太远，走近一半';
+    else if (area < 0.10) msg = '🔍 稍远，再近一步';
+    else if (area > 0.50) msg = '🔍 太近了，退一大步';
+    else if (area > 0.35) msg = '🔍 稍近，退半步';
+    else if (D(rx, 1/3) < 0.06 || D(rx, 2/3) < 0.06) msg = '↔️ 几乎到位！微调1~2厘米';
+    else if (rx < 0.20) msg = '👉 往右挪一大步';
+    else if (rx < 1/3)  msg = '👉 再往右一点，快到三分线';
+    else if (rx > 0.80) msg = '👈 往左挪一大步';
+    else if (rx > 2/3)  msg = '👈 再往左一点，快到三分线';
+    else                msg = '↔️ 人别放正中间，往左/右三分线挪';
+    if (area >= 0.05 && area <= 0.50) {
+      if (ry > 0.60)      msg += '｜⬆️ 抬高手机';
+      else if (ry < 0.20) msg += '｜⬇️ 压低手机';
+    }
+    coachEl.textContent = msg;
+  } catch(e) {}
+}
+setInterval(coach, 700);
+
+// ★ 人像姿态提示
+const POSES = [
+  '📸 试试蹲下仰拍：显腿长',
+  '📸 身体侧转45°：比正面显瘦',
+  '📸 头顶留白别太多：头发离顶边留1/5',
+  '📸 下巴微收、舌尖抵上颚：下颌线更清晰',
+  '📸 光从侧前方45°打来时最有立体感'
+];
+let poseIdx = 0;
+function rotatePose() {
+  poseEl.textContent = (scene === '人像') ? POSES[poseIdx % POSES.length] : '';
+  poseIdx++;
+}
+setInterval(rotatePose, 8000);
+rotatePose();
+
+function draw() {
+  requestAnimationFrame(draw);
+  c.width = innerWidth; c.height = innerHeight;
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw) return;
+  const s = Math.max(c.width / vw, c.height / vh);
+  const dw = vw * s, dh = vh * s, dx = (c.width - dw) / 2, dy = (c.height - dh) / 2;
+  ctx.save();
+  if (mirrored) { ctx.translate(c.width, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(v, dx, dy, dw, dh);
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,80,80,0.85)'; ctx.lineWidth = 2;
+  for (let i = 1; i < 3; i++) {
+    ctx.beginPath(); ctx.moveTo(dx + dw * i / 3, dy); ctx.lineTo(dx + dw * i / 3, dy + dh); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(dx, dy + dh * i / 3); ctx.lineTo(dx + dw, dy + dh * i / 3); ctx.stroke();
+  }
+  ctx.fillStyle = 'gold';
+  for (let i = 1; i < 3; i++) for (let j = 1; j < 3; j++) {
+    ctx.beginPath(); ctx.arc(dx + dw * i / 3, dy + dh * j / 3, 6, 0, 7); ctx.fill();
+  }
+}
+v.addEventListener('loadedmetadata', draw);
+
+function shoot() {
+  const s = Math.max(v.videoWidth / innerWidth, v.videoHeight / innerHeight);
+  const cv = document.createElement('canvas');
+  cv.width = innerWidth; cv.height = innerHeight;
+  const x = (v.videoWidth - cv.width * s) / 2, y = (v.videoHeight - cv.height * s) / 2;
+  const g = cv.getContext('2d');
+  if (mirrored) { g.translate(cv.width, 0); g.scale(-1, 1); }
+  g.drawImage(v, x, y, cv.width * s, cv.height * s, 0, 0, cv.width, cv.height);
+  window.open(cv.toDataURL('image/jpeg'), '_blank');
+}
+start();
+</script>
+</body>
+</html>
