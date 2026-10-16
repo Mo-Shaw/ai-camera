@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-📷 AI摄影教练 app端 V2.7.1（新增镜像模式）
-三模式：🔍找机位 / 📸直接拍照（支持镜像）/ 📁上传点评
+📷 AI摄影教练 app端 V2.7.3
+变更：删除镜像功能（归位给camera.html取景器）
+     新增"先去取景器看参数"动线引导
 """
 
 import base64
@@ -9,6 +10,8 @@ import io
 from openai import OpenAI
 from PIL import Image, ImageDraw
 import streamlit as st
+
+VIEWER_URL = "https://mo-shaw.github.io/ai-camera/camerav2.7.html"  # 取景器地址
 
 # ============================================================
 # 画图工具
@@ -100,7 +103,7 @@ def ask_ai(api_key, image_bytes, model, system_prompt):
 # 界面
 # ============================================================
 st.set_page_config(page_title="AI摄影教练", page_icon="📷")
-st.title("📷 AI摄影教练 V2.7.1")
+st.title("📷 AI摄影教练")
 st.caption("🔍找机位 → 👁取景器摆位 → 自带相机拍 → 📁上传点评")
 
 with st.sidebar:
@@ -109,12 +112,17 @@ with st.sidebar:
                             help="bigmodel.cn 免费申请，sk-开头")
     model = st.selectbox("视觉模型", ["glm-4v-flash", "glm-4v", "glm-4.5v"])
     color_hex = st.color_picker("网格颜色", "#FF5050")
-    # ★ 新增：镜像开关（只影响「直接拍照」标签）
-    mirror = st.checkbox("🪞 镜像模式（自拍用）", help="翻转拍照画面，像照镜子")
     st.divider()
     st.caption("免费额度用完会报错，第二天自动恢复")
 
-tab_scout, tab_cam, tab_up = st.tabs(["🔍 找机位", "📸 直接拍照", "📁 上传点评"])
+# ★ Key引导横幅
+if not api_key:
+    st.warning("🔑 **第一次用？先花2分钟领一把钥匙：** 浏览器打开 **bigmodel.cn** → 注册登录 → 控制台找「API Keys」→ 创建 → 复制 **sk-开头** 的那串字符 → 填到**左侧栏**。")
+
+# ★ 新增：正确动线引导（拍前去取景器看参数，拍完回来点评）
+st.info("💡 **推荐流程：① 先打开 [👁 取景器](" + VIEWER_URL + ") 看实时构图+ISO/快门建议 → ② 用手机自带相机正式拍 → ③ 回到本页上传点评。本页的「直接拍照」仅供临时应急，实时摆位请用取景器。")
+
+tab_scout, tab_cam, tab_up = st.tabs(["🔍 找机位", "📸 直接拍照(应急)", "📁 上传点评"])
 
 # ---------- 模式①：找机位 ----------
 with tab_scout:
@@ -134,8 +142,9 @@ with tab_scout:
                     st.error(f"出错了：{e}")
                     st.info("检查Key / 额度 / 换模型名")
 
-# ---------- 模式②：直接拍照（含镜像）----------
+# ---------- 模式②：直接拍照（应急，已删镜像——镜像属于取景器） ----------
 with tab_cam:
+    st.markdown("**📸 拍照三步：① 允许摄像头 → ② 点「Take Photo」→ ③ 自动出网格+AI分析**")
     if "cam_id" not in st.session_state:
         st.session_state["cam_id"] = 0
     if st.button("🔄 重拍一张"):
@@ -144,9 +153,6 @@ with tab_cam:
                                    key=f"cam_{st.session_state['cam_id']}")
     if camera_photo:
         img = Image.open(camera_photo)
-        # ★ 镜像：拍到的原图水平翻转，之后显示/网格/AI分析都用翻转后的图
-        if mirror:
-            img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("原图"); st.image(img, use_container_width=True)
@@ -158,7 +164,6 @@ with tab_cam:
         else:
             with st.spinner("AI分析中，约10秒……"):
                 try:
-                    # 注意：镜像后AI看到的图和你屏幕一致，左右描述不会拧
                     advice = ask_ai(api_key, camera_photo.getvalue(), model, REVIEW_PROMPT)
                     st.subheader("🧠 AI分析")
                     st.markdown(advice)
@@ -170,9 +175,10 @@ with tab_cam:
                     st.error(f"出错了：{e}")
                     st.info("检查Key / 额度 / 换模型名")
 
-# ---------- 模式③：上传点评 ----------
+# ---------- 模式③：上传点评（主战场） ----------
 with tab_up:
-    up = st.file_uploader("选择一张照片", type=["jpg", "jpeg", "png"])
+    st.markdown("**把你刚用自带相机拍好的照片传上来，AI给你逐条点评** 👇")
+    up = st.file_uploader("选择照片（jpg/png）", type=["jpg", "jpeg", "png"])
     if up:
         img = Image.open(up)
         col1, col2 = st.columns(2)
